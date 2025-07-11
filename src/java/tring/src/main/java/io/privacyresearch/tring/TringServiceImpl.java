@@ -220,7 +220,9 @@ public class TringServiceImpl implements TringService {
     // see Android IncomingGroupCallActionProcessor.handleAcceptCall
     @Override
     public long createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf) {
-        this.localGroupId = groupId;
+        if (groupId != null && groupId.length > 0) {
+            this.localGroupId = groupId;
+        }
         LOG.info("delegate creategroupcallclient to rust, groupId = " + Arrays.toString(localGroupId));
         long myclientId = tringlib_h.createGroupCallClient(callEndpoint, toJByteArray(scope, localGroupId),
                 toJString(scope, sfu), toJByteArray(scope, hkdf));
@@ -565,6 +567,7 @@ public class TringServiceImpl implements TringService {
                 byte[] groupId = new byte[groupIdLen];
                 bb.get(groupId);
                 TringServiceImpl.this.localGroupId = groupId;
+                LOG.info("Done setting groupId to "+Arrays.toString(TringServiceImpl.this.localGroupId));
                 long ringId = bb.getLong();
                 byte[] senderBytes = new byte[bb.remaining() - 1];
                 bb.get(senderBytes);
@@ -585,6 +588,7 @@ public class TringServiceImpl implements TringService {
                 ByteBuffer bb = ByteBuffer.wrap(bytes);
                 int clientId = bb.getInt();
                 Runnable r = () -> {
+                    LOG.info("Requesting membership proof, groupid = "+Arrays.toString(TringServiceImpl.this.localGroupId));
                     byte[] token = api.requestGroupMembershipToken(TringServiceImpl.this.localGroupId);
                     tringlib_h.setMembershipProof(callEndpoint, clientId, toJByteArray(scope, token));
                 };

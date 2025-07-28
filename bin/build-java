@@ -165,7 +165,7 @@ fi
     echo "Build final RingRTC"
     if [ "${BUILD_TYPE}" = "debug" ]
     then
-        RUSTFLAGS="${RUSTFLAGS_WIN}" OUTPUT_DIR="${OUTPUT_DIR}" cargo build --target ${CARGO_TARGET} --features java
+        RUSTFLAGS="${RUSTFLAGS_WIN}" OUTPUT_DIR="${OUTPUT_DIR}" cargo rustc --package ringrtc --target ${CARGO_TARGET} --features java --crate-type cdylib
     else
         #OUTPUT_DIR="${OUTPUT_DIR}" cargo build --target ${CARGO_TARGET} --lib --features java --release
         RUSTFLAGS="${RUSTFLAGS}" OUTPUT_DIR="${OUTPUT_DIR}" cargo rustc --package ringrtc --target ${CARGO_TARGET} --features java --release --crate-type cdylib

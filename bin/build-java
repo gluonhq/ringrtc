@@ -184,13 +184,13 @@ fi
         mkdir -p ../java/build/win32
         cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/ringrtc.dll ../java/tring/src/main/resources/ringrtc.dll
         # cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/ringrtc.dll ../java/build/win32/libringrtc-"${TARGET_ARCH}".java
-        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/win32 --output ../java/tring/src/main/java -t io.privacyresearch.tring tringlib.h
+        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/win32 --output ../java/tring/src/gen-sources/java -t io.privacyresearch.tring tringlib.h
     elif [ $DEFAULT_PLATFORM = "linux" ]
     then
         mkdir -p ../java/build/linux
         cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/libringrtc.so ../java/tring/src/main/resources/libringrtc.so
         #cp -f target/${CARGO_TARGET}/${BUILD_TYPE}/libringrtc.so ../java/build/linux/libringrtc-"${TARGET_ARCH}".java
-        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/linux --output ../java/tring/src/main/java -t io.privacyresearch.tring tringlib.h
+        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/linux --output ../java/tring/src/gen-sources/java -t io.privacyresearch.tring tringlib.h
     fi
     cd ../java/tringapi
     mvn clean install

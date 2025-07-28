@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>io.privacyresearch</groupId>
     <artifactId>tring</artifactId>
-    <version>0.0.21</version>
+    <version>0.0.22-SNAPSHOT</version>
     <packaging>jar</packaging>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -20,7 +20,7 @@
         <dependency>
             <groupId>io.privacyresearch</groupId>
             <artifactId>tringapi</artifactId>
-            <version>0.0.16</version>
+            <version>0.0.17-SNAPSHOT</version>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>

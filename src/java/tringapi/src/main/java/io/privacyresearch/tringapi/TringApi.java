@@ -17,7 +17,7 @@ public interface TringApi {
 
     void iceUpdateCallback(List<byte[]> iceCandidates);
 
-    void groupCallUpdateRing(byte[] groupId, long ringId, byte[] senderBytes, byte status);
+    void groupCallUpdateRing(byte[] groupId, long ringId, byte[] senderBytes, int status);
     // void getVideoFrame(int w, int h, byte[] raw);
 
     public void receivedGroupCallPeekForRingingCheck(PeekInfo peekInfo);
@@ -28,8 +28,8 @@ public interface TringApi {
 
     public void sendOpaqueGroupCallMessage(byte[] groupIdentifier, byte[] opaque, int urgency);
 
-    public void sendOpaqueCallMessage(UUID recipient, byte[] opaque, int urgency);
+    public void sendOpaqueCallMessage(byte[] recipientIdentifier, byte[] opaque, int urgency);
 
-    public void updateRemoteDevices(List<Integer> demuxIds);
+    public void updateRemoteDevices(List<Long> demuxIds);
 
 }

@@ -89,7 +89,7 @@ public class TringBridge {
         service.enableOutgoingVideo(enable);
     }
 
-    public TringFrame getRemoteVideoFrame(int demuxId) {
+    public TringFrame getRemoteVideoFrame(long demuxId) {
         return service.getRemoteVideoFrame(demuxId);
     }  
 
@@ -105,7 +105,7 @@ public class TringBridge {
         service.peekGroupCall(membershipProof, members);
     }
 
-    public long createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf) {
+    public int createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf) {
         return service.createGroupCallClient(groupId, sfu, hkdf);
     }
 

@@ -6,8 +6,8 @@ use jni::sys::{jint, jlong, JNI_VERSION_1_6};
 use jni::{JNIEnv, JavaVM};
 
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
 
+use std::fmt;
 use std::os::raw::c_void;
 use std::slice;
 use std::sync::atomic::AtomicBool;
@@ -20,14 +20,17 @@ use libc::size_t;
 use crate::common::{CallConfig, CallId, CallMediaType, DataMode, DeviceId, Result};
 use crate::core::call_manager::CallManager;
 use crate::core::group_call;
-use crate::core::group_call::{GroupId, SignalingMessageUrgency};
+use crate::core::group_call::{ClientId, GroupId, SignalingMessageUrgency};
 use crate::core::signaling;
 use crate::core::util::ptr_as_mut;
 
-use crate::java::jtypes::{JArrayByte, JByteArray, JByteArray2D, JPString, TringDevice};
+use crate::java::{
+    app_interface::AppInterface,
+    jtypes::{JArrayByte, JByteArray, JByteArray2D, JPString, TringDevice},
+};
 
 use crate::lite::http;
-use crate::lite::sfu::{GroupMember, UserId};
+use crate::lite::sfu::{DemuxId, GroupMember, UserId};
 use crate::native::{
     CallState, CallStateHandler, GroupUpdate, GroupUpdateHandler, NativeCallContext,
     NativePlatform, PeerId, SignalingSender,
@@ -42,9 +45,11 @@ use crate::webrtc::peer_connection::AudioLevel;
 use crate::webrtc::peer_connection_factory::{self as pcf, IceServer, PeerConnectionFactory};
 use crate::webrtc::peer_connection_observer::NetworkRoute;
 
+const JAVA_LANG_LONG_CLASS: &str = "java/lang/Long";
 const JAVA_UTIL_LIST_CLASS: &str = "java/util/List";
 const JAVA_UTIL_ARRAY_LIST_CLASS: &str = "java/util/ArrayList";
 
+static mut JAVA_LANG_LONG_CTOR: Option<JMethodID> = None;
 static mut JAVA_UTIL_LIST_ADD: Option<JMethodID> = None;
 static mut JAVA_UTIL_ARRAY_LIST_CTOR: Option<JMethodID> = None;
 
@@ -96,6 +101,8 @@ unsafe fn init_cache(env: &mut JNIEnv) -> Result<()> {
         "handlePeekChanged",
         "(Ljava/util/List;[BLjava/lang/String;JJ)V",
     )?);
+    JAVA_LANG_LONG_CTOR =
+        Some(env.get_method_id(JAVA_LANG_LONG_CLASS, "<init>", "(J)V")?);
     JAVA_UTIL_LIST_ADD =
         Some(env.get_method_id(JAVA_UTIL_LIST_CLASS, "add", "(Ljava/lang/Object;)Z")?);
     JAVA_UTIL_ARRAY_LIST_CTOR =
@@ -125,11 +132,11 @@ pub unsafe extern "C" fn Java_io_privacyresearch_tring_TringServiceImpl_requestV
     _env: JNIEnv,
     _obj: JObject,
     endpoint: i64,
-    clientid: u32,
-    demuxid: u32,
+    client_id: ClientId,
+    demux_id: DemuxId,
 ) {
     info!("request video");
-    requestVideo(endpoint, clientid, demuxid);
+    requestVideo(endpoint, client_id, demux_id);
 }
 
 /*
@@ -217,9 +224,6 @@ fn make_http_request(url: String, method: i8, reqid: i32, data: Vec<u8>, body: V
     }
 }
 
-fn handle_peek_response(body: Vec<u8>) {
-    unsafe {}
-}
 // == END JNI
 
 fn init_logging() {
@@ -292,16 +296,47 @@ pub enum Event {
     },
 }
 
+impl fmt::Display for Event {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let display = match self {
+            Event::SendSignaling(_, _, _, _) => "SendSignaling".to_string(),
+            Event::SendCallMessage { .. } => "SendCallMessage".to_string(),
+            Event::SendCallMessageToGroup { .. } => "SendCallMessageToGroup".to_string(),
+            Event::CallState(_, _, _) => "CallState".to_string(),
+            Event::RemoteAudioStateChange(_, _) => "RemoteAudioStateChange".to_string(),
+            Event::RemoteVideoStateChange { .. } => "RemoteVideoStateChange".to_string(),
+            Event::RemoteSharingScreenChange { .. } => "RemoteSharingScreenChange".to_string(),
+            Event::GroupUpdate(update) => {
+                format!("GroupUpdate({:?})", update)
+            }
+            Event::SendHttpRequest { .. } => "SendHttpRequest".to_string(),
+            Event::NetworkRouteChange(_, network_route) => {
+                format!("NetworkRouteChange({:?})", network_route)
+            }
+            Event::AudioLevels { captured_level, received_level, .. } => {
+                format!("AudioLevels({:?}, {:?})", captured_level, received_level)
+            }
+            Event::LowBandwidthForVideo { recovered, .. } => {
+                format!("LowBandwidthForVideo({})", recovered)
+            }
+        };
+        write!(f, "({})", display)
+    }
+}
+
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
 /// Wraps a [`std::sync::mpsc::Sender`] with a callback to report new events.
 #[derive(Clone)]
 #[repr(C)]
 #[allow(non_snake_case)]
 struct EventReporter {
+    app_interface: AppInterface,
     pub statusCallback: unsafe extern "C" fn(u64, u64, i32, i32),
-    pub answerCallback: unsafe extern "C" fn(JArrayByte),
-    pub offerCallback: unsafe extern "C" fn(JArrayByte),
-    pub iceUpdateCallback: unsafe extern "C" fn(JArrayByte),
-    pub genericCallback: unsafe extern "C" fn(i32, JArrayByte),
     sender: Sender<Event>,
     report: Arc<dyn Fn() + Send + Sync>,
 }
@@ -316,20 +351,14 @@ fn string_to_bytes(v: String) -> Vec<u8> {
 
 impl EventReporter {
     fn new(
+        app_interface: AppInterface,
         statusCallback: extern "C" fn(u64, u64, i32, i32),
-        answerCallback: extern "C" fn(JArrayByte),
-        offerCallback: extern "C" fn(JArrayByte),
-        iceUpdateCallback: extern "C" fn(JArrayByte),
-        genericCallback: extern "C" fn(i32, JArrayByte),
         sender: Sender<Event>,
         report: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self {
+            app_interface,
             statusCallback,
-            answerCallback,
-            offerCallback,
-            iceUpdateCallback,
-            genericCallback,
             sender,
             report: Arc::new(report),
         }
@@ -345,27 +374,16 @@ impl EventReporter {
                             "[JV] SendSignaling OFFER Event and call_id = {}",
                             call_id.as_u64()
                         );
-                        let op = JArrayByte::new(offer.opaque);
-                        unsafe {
-                            (self.offerCallback)(op);
-                        }
+                        (self.app_interface.signalingMessageOffer)(JArrayByte::new(offer.opaque));
                     }
                     signaling::Message::Answer(answer) => {
                         info!("[JV] SendSignaling ANSWER Event");
-                        let op = JArrayByte::new(answer.opaque);
-                        unsafe {
-                            (self.answerCallback)(op);
-                        }
+                        (self.app_interface.signalingMessageAnswer)(JArrayByte::new(answer.opaque));
                     }
                     signaling::Message::Ice(ice) => {
                         info!("[JV] SendSignaling ICE Event");
-                        let ilen = ice.candidates.len();
-                        unsafe {
-                            for i in 0..ilen {
-                                (self.iceUpdateCallback)(JArrayByte::new(
-                                    ice.candidates[i].opaque.clone(),
-                                ));
-                            }
+                        for (_, candidate) in ice.candidates.iter().enumerate() {
+                            (self.app_interface.signalingMessageIce)(JArrayByte::new(candidate.opaque.clone()));
                         }
                     }
                     signaling::Message::Hangup(hangup) => {
@@ -391,14 +409,14 @@ impl EventReporter {
                 info!("JavaPlatform asked app to send SignalingEvent");
             }
             Event::CallState(_peer_id, call_id, CallState::Incoming(call_media_type)) => {
-                info!("[JV] CALLSTATEEVEMNT");
+                info!("[JV] CallState incoming");
                 let direction = 0;
                 unsafe {
                     (self.statusCallback)(call_id.as_u64(), 1, direction, call_media_type as i32);
                 }
             }
             Event::CallState(_peer_id, call_id, CallState::Outgoing(call_media_type)) => {
-                info!("[JV] CALLSTATEEVEMNT");
+                info!("[JV] CallState outgoing");
                 let direction = 1;
                 unsafe {
                     (self.statusCallback)(call_id.as_u64(), 1, direction, call_media_type as i32);
@@ -493,16 +511,7 @@ impl EventReporter {
                     "SendCallMessage! recuuid = {:?}, msg = {:?}, urg = {:?}",
                     recipient_uuid, message, urgency
                 );
-                let mut payload: Vec<u8> = Vec::new();
-                payload.extend(recipient_uuid);
-                let mlen: i32 = message.len().try_into().unwrap();
-                payload.extend_from_slice(&mlen.to_be_bytes());
-                payload.extend(message);
-                info!("payloadlength = {}", payload.len());
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(5, data);
-                }
+                (self.app_interface.sendCallMessage)(JArrayByte::new(recipient_uuid), JArrayByte::new(message), urgency as i32);
             }
             Event::SendCallMessageToGroup {
                 group_id,
@@ -513,39 +522,17 @@ impl EventReporter {
                     "SendCallMessageToGroup! gid = {:?}, msg = {:?}, urg = {:?}",
                     group_id, message, urgency
                 );
-                let mut payload: Vec<u8> = Vec::new();
-                let glen: i32 = group_id.len().try_into().unwrap();
-                payload.extend_from_slice(&glen.to_be_bytes());
-
-                payload.extend(&group_id);
-                payload.extend(&message);
-
-                payload.push(urgency as u8);
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(7, data);
-                }
+                info!("LENGTH RUST: {}", group_id.len());
+                (self.app_interface.sendCallMessageToGroup)(JArrayByte::new(group_id), JArrayByte::new(message), urgency as i32);
             }
             Event::GroupUpdate(GroupUpdate::RequestMembershipProof(client_id)) => {
                 info!("RMP");
-                let mut payload: Vec<u8> = Vec::new();
-                let cid: i32 = client_id.try_into().unwrap();
-                payload.extend_from_slice(&cid.to_be_bytes());
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(3, data);
-                }
-                info!("invoked RequestMemebershipProof");
+                (self.app_interface.groupRequestMembershipProof)(client_id);
+                info!("invoked RequestMembershipProof");
             }
             Event::GroupUpdate(GroupUpdate::RequestGroupMembers(client_id)) => {
                 info!("RGM");
-                let mut payload: Vec<u8> = Vec::new();
-                let cid: i32 = client_id.try_into().unwrap();
-                payload.extend_from_slice(&cid.to_be_bytes());
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(4, data);
-                }
+                (self.app_interface.groupRequestGroupMembers)(client_id);
                 info!("invoked RequestGroupMembers");
             }
             Event::GroupUpdate(GroupUpdate::ConnectionStateChanged(
@@ -553,15 +540,7 @@ impl EventReporter {
                 connection_state,
             )) => {
                 info!("invoke CSTATEChanged");
-                let mut payload: Vec<u8> = Vec::new();
-                let cid: i32 = client_id.try_into().unwrap();
-                payload.extend_from_slice(&cid.to_be_bytes());
-                let csid: i32 = connection_state as i32;
-                payload.extend_from_slice(&csid.to_be_bytes());
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(2, data);
-                }
+                (self.app_interface.groupConnectionStateChanged)(client_id, connection_state.ordinal());
                 info!("invoked CSTATEChanged");
             }
             Event::GroupUpdate(GroupUpdate::NetworkRouteChanged(client_id, network_route)) => {
@@ -569,15 +548,13 @@ impl EventReporter {
             }
             Event::GroupUpdate(GroupUpdate::JoinStateChanged(client_id, join_state)) => {
                 info!("JoinStatesChanged");
-                let mut payload: Vec<u8> = Vec::new();
-                let cid: i32 = client_id.try_into().unwrap();
-                payload.extend_from_slice(&cid.to_be_bytes());
-                let csid: i32 = join_state.ordinal();
-                payload.extend_from_slice(&csid.to_be_bytes());
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(6, data);
-                }
+                let app_demux_id = match join_state {
+                    group_call::JoinState::Pending(demux_id) | group_call::JoinState::Joined(demux_id) => {
+                        Some(demux_id)
+                    }
+                    _ => None,
+                };
+                (self.app_interface.groupJoinStateChanged)(client_id, join_state.ordinal());
                 info!("invoked CSTATEChanged");
             }
             Event::GroupUpdate(GroupUpdate::RemoteDeviceStatesChanged(
@@ -596,22 +573,21 @@ impl EventReporter {
                         )
                         .unwrap();
                     for (i, remote_device_state) in remote_device_states.iter().enumerate() {
-                        // let mut payload:Vec<u8> = Vec::new();
-                        // payload.extend_from_slice(&remote_device_state.demux_id.to_be_bytes());
-                        let jni_demux_id = match env
-                            .byte_array_from_slice(&remote_device_state.demux_id.to_be_bytes())
-                        {
-                            Ok(v) => JObject::from(v),
-                            Err(error) => {
-                                error!("{:?}", error);
-                                continue;
-                            }
-                        };
+                        let jni_remote_demux_id_primitive = remote_device_state.demux_id as jlong;
+
+                        let jni_remote_demux_id = env
+                            .new_object_unchecked(
+                                JAVA_LANG_LONG_CLASS,
+                                JAVA_LANG_LONG_CTOR.unwrap(),
+                                &[JValue::Long(jni_remote_demux_id_primitive).as_jni()],
+                            )
+                            .unwrap();
+
                         env.call_method_unchecked(
                             &jni_devices,
                             JAVA_UTIL_LIST_ADD.unwrap(),
                             ReturnType::Primitive(Primitive::Boolean),
-                            &[JValue::Object(&jni_demux_id).as_jni()],
+                            &[JValue::Object(&jni_remote_demux_id).as_jni()],
                         )
                         .expect(&format!(
                             "Couldn't invoke method {} on class {}",
@@ -782,7 +758,9 @@ impl EventReporter {
                 }
             }
             Event::GroupUpdate(GroupUpdate::Ended(client_id, reason)) => {
-                info!("NYI ENDED");
+                info!("GroupUpdate::Ended: client_id={}, reason={:?}", client_id, reason);
+                (self.app_interface.groupEnded)(client_id, reason);
+                info!("invoked GroupUpdate::Ended");
             }
             Event::GroupUpdate(GroupUpdate::Ring {
                 group_id,
@@ -791,24 +769,13 @@ impl EventReporter {
                 update,
             }) => {
                 info!(
-                    "[JV] GroupUpdate, gid = {:?}, ringid = {:?}, sender = {:?}, update = {:?}",
+                    "[JV] GroupUpdate::Ring, gid = {:?}, ringid = {:?}, sender = {:?}, update = {:?}",
                     group_id, ring_id, sender_id, update
                 );
-                let mut payload: Vec<u8> = Vec::new();
-                let glen: i32 = group_id.len().try_into().unwrap();
-                payload.extend_from_slice(&glen.to_be_bytes());
-                payload.extend(group_id);
-                let rid: i64 = ring_id.into();
-                payload.extend_from_slice(&rid.to_be_bytes());
-                payload.extend(sender_id);
-                payload.push(update as u8);
-                let data = JArrayByte::new(payload);
-                unsafe {
-                    (self.genericCallback)(1, data);
-                }
+                (self.app_interface.groupRing)(JArrayByte::new(group_id), ring_id.into(), JArrayByte::new(sender_id), update as i32);
             }
-            _ => {
-                info!("[JV] unknownevent");
+            unhandled_event => {
+                info!("Unhandled event detected: {:?}", unhandled_event);
             }
         };
 
@@ -980,19 +947,13 @@ pub struct CallEndpoint {
     // Boxed so we can pass it as a Box<dyn VideoSink>
     incoming_video_sink: Box<LastFramesVideoSink>,
     peer_connection_factory: PeerConnectionFactory,
-    videoFrameCallback: extern "C" fn(*const u8, u32, u32, size_t),
-    // javavm: Option<JavaVM>,
 }
 
 impl CallEndpoint {
     fn new<'a>(
         use_new_audio_device_module: bool,
+        app_interface: AppInterface,
         statusCallback: extern "C" fn(u64, u64, i32, i32),
-        answerCallback: extern "C" fn(JArrayByte),
-        offerCallback: extern "C" fn(JArrayByte),
-        iceUpdateCallback: extern "C" fn(JArrayByte),
-        genericCallback: extern "C" fn(i32, JArrayByte),
-        videoFrameCallback: extern "C" fn(*const u8, u32, u32, size_t),
     ) -> Result<Self> {
         // Relevant for both group calls and 1:1 calls
         let (events_sender, _events_receiver) = channel::<Event>();
@@ -1007,13 +968,9 @@ impl CallEndpoint {
 
         let event_reported = Arc::new(AtomicBool::new(false));
 
-        // let javavm = None;
         let event_reporter = EventReporter::new(
+            app_interface,
             statusCallback,
-            answerCallback,
-            offerCallback,
-            iceUpdateCallback,
-            genericCallback,
             events_sender,
             move || {
                 info!("[JV] EVENT_REPORTER, NYI");
@@ -1021,7 +978,6 @@ impl CallEndpoint {
                     return;
                 }
             },
-            // javavm,
         );
         // Only relevant for 1:1 calls
         let signaling_sender = Box::new(event_reporter.clone());
@@ -1048,24 +1004,13 @@ impl CallEndpoint {
             outgoing_video_track,
             incoming_video_sink,
             peer_connection_factory,
-            videoFrameCallback,
-            // javavm,
         })
     }
-
-    /*
-        fn java_env(&self) -> Result<JNIEnv> {
-            match self.javavm.get_env() {
-                Ok(v) => Ok(v),
-                Err(_e) => Ok(self.javavm.attach_current_thread_as_daemon()?),
-            }
-        }
-    */
 }
 
 #[derive(Clone, Default)]
 struct LastFramesVideoSink {
-    last_frame_by_track_id: Arc<Mutex<HashMap<u32, VideoFrame>>>,
+    last_frame_by_track_id: Arc<Mutex<HashMap<DemuxId, VideoFrame>>>,
 }
 
 impl VideoSink for LastFramesVideoSink {
@@ -1118,33 +1063,17 @@ pub unsafe extern "C" fn getVersion() -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn createCallEndpoint(
+    appInterface: AppInterface,
     statusCallback: extern "C" fn(u64, u64, i32, i32),
-    answerCallback: extern "C" fn(JArrayByte),
-    offerCallback: extern "C" fn(JArrayByte),
-    iceUpdateCallback: extern "C" fn(JArrayByte),
-    genericCallback: extern "C" fn(i32, JArrayByte),
-    videoFrameCallback: extern "C" fn(*const u8, u32, u32, size_t),
 ) -> i64 {
     let call_endpoint = CallEndpoint::new(
         false,
+        appInterface,
         statusCallback,
-        answerCallback,
-        offerCallback,
-        iceUpdateCallback,
-        genericCallback,
-        videoFrameCallback,
     )
     .unwrap();
     let call_endpoint_box = Box::new(call_endpoint);
-    let boxx: Result<*mut CallEndpoint> = Ok(Box::into_raw(call_endpoint_box));
-
-    let answer: i64 = match boxx {
-        Ok(v) => v as i64,
-        Err(e) => {
-            info!("Error creating callEndpoint: {}", e);
-            0
-        }
-    };
+    let answer = Box::into_raw(call_endpoint_box) as i64;
     info!("[tring] CallEndpoint created at {}", answer);
     answer
 }
@@ -1501,15 +1430,15 @@ pub unsafe extern "C" fn fillLargeArray(endpoint: i64, mybuffer: *mut u8) -> i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fillRemoteVideoFrame(endpoint: i64, demuxId: u32, mybuffer: *mut u8, len: usize) -> i64 {
-    info!("Have to retrieve remote video frame, trackId = {}", demuxId);
+pub unsafe extern "C" fn fillRemoteVideoFrame(endpoint: i64, demux_id: i64, video_buffer_out: *mut u8, len: usize) -> i64 {
+    info!("Have to retrieve remote video frame, trackId = {}", demux_id);
     let endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    let frame = endpoint.incoming_video_sink.pop(demuxId);
+    let frame = endpoint.incoming_video_sink.pop(demux_id as DemuxId);
     if let Some(frame) = frame {
         let frame = frame.apply_rotation();
         let width: u32 = frame.width();
         let height: u32 = frame.height();
-        let myframe: &mut [u8] = slice::from_raw_parts_mut(mybuffer, len);
+        let myframe: &mut [u8] = slice::from_raw_parts_mut(video_buffer_out, len);
         frame.to_rgba(myframe);
         info!(
             "Frame0 = {}, w = {}, h = {}",
@@ -1595,7 +1524,7 @@ pub unsafe extern "C" fn createGroupCallClient(
     group_id: JByteArray,
     sf_url: JPString,
     hkdf_extra_info: JByteArray,
-) -> i64 {
+) -> ClientId {
     info!("We Need to create groupcallclient");
     let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
     let audio_levels_interval = None;
@@ -1604,7 +1533,7 @@ pub unsafe extern "C" fn createGroupCallClient(
     let outgoing_video_track = callendpoint.outgoing_video_track.clone();
     let incoming_video_sink = callendpoint.incoming_video_sink.clone();
     info!("Need to create groupcallclient, got all params");
-    let result = callendpoint.call_manager.create_group_call_client(
+    let client_id = callendpoint.call_manager.create_group_call_client(
         group_id.to_vec_u8(),
         sf_url.to_string(),
         hkdf_extra_info.to_vec_u8(),
@@ -1615,20 +1544,26 @@ pub unsafe extern "C" fn createGroupCallClient(
         Some(incoming_video_sink),
     );
 
-    let mut client_id = 0;
-    if let Ok(v) = result {
-        client_id = v;
-    }
     info!("And return the client_id");
-    client_id as i64
+    client_id.unwrap_or(0)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn setOutgoingAudioMuted(endpoint: i64, client_id: u32, muted: bool) -> i64 {
-    info!("need to set audio muted to {}", muted);
+pub unsafe extern "C" fn deleteGroupCallClient(
+    endpoint: i64,
+    client_id: ClientId,
+) {
+    info!("We need to delete groupcallclient");
     let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint.outgoing_audio_track.set_enabled(!muted);
-    callendpoint
+    callendpoint.call_manager.delete_group_call_client(client_id);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn setOutgoingAudioMuted(endpoint: i64, client_id: ClientId, muted: bool) -> i64 {
+    info!("need to set audio muted to {}", muted);
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint.outgoing_audio_track.set_enabled(!muted);
+    call_endpoint
         .call_manager
         .set_outgoing_audio_muted(client_id, muted);
     info!("Done setting outgoingaudiomuted");
@@ -1636,11 +1571,11 @@ pub unsafe extern "C" fn setOutgoingAudioMuted(endpoint: i64, client_id: u32, mu
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn setOutgoingVideoMuted(endpoint: i64, client_id: u32, muted: bool) -> i64 {
+pub unsafe extern "C" fn setOutgoingVideoMuted(endpoint: i64, client_id: ClientId, muted: bool) -> i64 {
     info!("need to set video muted to {}", muted);
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint.outgoing_video_track.set_enabled(!muted);
-    callendpoint
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint.outgoing_video_track.set_enabled(!muted);
+    call_endpoint
         .call_manager
         .set_outgoing_video_muted(client_id, muted);
     info!("Done setting outgoingvideomuted");
@@ -1650,31 +1585,31 @@ pub unsafe extern "C" fn setOutgoingVideoMuted(endpoint: i64, client_id: u32, mu
 /*
 #[no_mangle]
 pub unsafe extern "C" fn setBandwidthMode (endpoint: i64,
-            client_id: u32, mode: i32) -> i64 {
+            client_id: ClientId, mode: i32) -> i64 {
     info!("need to set bandwidth mode to {}", mode);
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint.call_manager.set_bandwidth_mode(client_id, BandwithMode::from_i32(mode));
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint.call_manager.set_bandwidth_mode(client_id, BandwithMode::from_i32(mode));
     info!("Done setting bandwidthmode");
     1
 }
 */
 
 #[no_mangle]
-pub unsafe extern "C" fn group_ring(endpoint: i64, client_id: u32) -> i64 {
+pub unsafe extern "C" fn group_ring(endpoint: i64, client_id: ClientId) -> i64 {
     info!("need to RING!");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
     info!("ask callmanager to RING");
-    callendpoint.call_manager.group_ring(client_id, None);
+    call_endpoint.call_manager.group_ring(client_id, None);
     info!("asked callmanager to RING");
     1
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn group_connect(endpoint: i64, client_id: u32) -> i64 {
+pub unsafe extern "C" fn group_connect(endpoint: i64, client_id: ClientId) -> i64 {
     info!("need to connect!");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
     info!("ask callmanager to connect");
-    callendpoint.call_manager.connect(client_id);
+    call_endpoint.call_manager.connect(client_id);
     info!("asked callmanager to connect");
     1
 }
@@ -1682,12 +1617,12 @@ pub unsafe extern "C" fn group_connect(endpoint: i64, client_id: u32) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn setMembershipProof(
     endpoint: i64,
-    client_id: u32,
+    client_id: ClientId,
     token: JByteArray,
 ) -> i64 {
     info!("need to set_membershipProof");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint
         .call_manager
         .set_membership_proof(client_id, token.to_vec_u8());
     1
@@ -1696,14 +1631,14 @@ pub unsafe extern "C" fn setMembershipProof(
 #[no_mangle]
 pub unsafe extern "C" fn setGroupMembers(
     endpoint: i64,
-    client_id: u32,
+    client_id: ClientId,
     group_info: JByteArray,
 ) -> i64 {
     info!("need to set_membershipProof");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
     let ser_group_members = group_info.to_vec_u8();
     let group_members = deserialize_to_group_member_info(ser_group_members).unwrap();
-    callendpoint
+    call_endpoint
         .call_manager
         .set_group_members(client_id, group_members);
     1
@@ -1712,40 +1647,40 @@ pub unsafe extern "C" fn setGroupMembers(
 #[no_mangle]
 pub unsafe extern "C" fn setDataMode(
     endpoint: i64,
-    client_id: u32,
+    client_id: ClientId,
     data_mode: i32,
 ) -> i64 {
     info!("need to set_bandwidth_mode");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint
         .call_manager
         .set_data_mode(client_id, DataMode::from_i32(data_mode));
     1
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn join(endpoint: i64, client_id: u32) -> i64 {
+pub unsafe extern "C" fn join(endpoint: i64, client_id: ClientId) -> i64 {
     info!("need to join");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint.call_manager.join(client_id);
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint.call_manager.join(client_id);
     1
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn disconnect(endpoint: i64, client_id: u32) -> i64 {
+pub unsafe extern "C" fn disconnect(endpoint: i64, client_id: ClientId) -> i64 {
     info!("want to disconnect");
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
-    callendpoint.outgoing_audio_track.set_enabled(false);
-    callendpoint.outgoing_video_track.set_enabled(false);
-    callendpoint.outgoing_video_track.set_content_hint(false);
-    callendpoint.call_manager.disconnect(client_id);
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    call_endpoint.outgoing_audio_track.set_enabled(false);
+    call_endpoint.outgoing_video_track.set_enabled(false);
+    call_endpoint.outgoing_video_track.set_content_hint(false);
+    call_endpoint.call_manager.disconnect(client_id);
     1
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn requestVideo(endpoint: i64, client_id: u32, demux_id: u32) -> i64 {
+pub unsafe extern "C" fn requestVideo(endpoint: i64, client_id: ClientId, demux_id: DemuxId) -> i64 {
     info!("need to request video width demux_id = {}", demux_id);
-    let callendpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
+    let call_endpoint = ptr_as_mut(endpoint as *mut CallEndpoint).unwrap();
     let mut rendered_resolutions: Vec<group_call::VideoRequest> = Vec::new();
     let width = 320 as u16;
     let height = 200 as u16;
@@ -1759,7 +1694,7 @@ pub unsafe extern "C" fn requestVideo(endpoint: i64, client_id: u32, demux_id: u
 
     rendered_resolutions.push(rendered_resolution);
 
-    callendpoint
+    call_endpoint
         .call_manager
         .request_video(client_id, rendered_resolutions, 150);
     1

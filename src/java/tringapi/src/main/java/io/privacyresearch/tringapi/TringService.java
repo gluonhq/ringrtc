@@ -54,9 +54,9 @@ public interface TringService {
      * @param skip if true, ignore all old frames, and return the most recent one
      * @return a frame
      */
-    public TringFrame getRemoteVideoFrame(int demuxId, boolean skip);
+    public TringFrame getRemoteVideoFrame(long demuxId, boolean skip);
 
-    public default TringFrame getRemoteVideoFrame(int demuxId) {
+    public default TringFrame getRemoteVideoFrame(long demuxId) {
         return getRemoteVideoFrame(demuxId, false);
     }
     public void sendVideoFrame(int w, int h, int pixelFormat, byte[] raw);
@@ -65,7 +65,7 @@ public interface TringService {
 
     public void peekGroupCall(byte[] membershipProof, byte[] members);
 
-    public long createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf);
+    public int createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf);
 
     public void joinGroupCall();
 

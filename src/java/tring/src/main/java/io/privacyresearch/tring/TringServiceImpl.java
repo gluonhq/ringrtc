@@ -29,8 +29,6 @@ import java.util.Map.Entry;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -39,36 +37,35 @@ import java.util.logging.Logger;
 
 public class TringServiceImpl implements TringService {
 
+    private static final Logger LOG = Logger.getLogger(TringServiceImpl.class.getName());
+
     static final int BANDWIDTH_QUALITY_HIGH = 2;
     private static final TringService instance = new TringServiceImpl();
     private static boolean nativeSupport = false;
     private static long nativeVersion = 0;
 
+    private final TringExecutorService executorService = new TringExecutorService();
+
     private Arena scope;
+    private TringAppInterface tringAppInterface;
     private long callEndpoint;
     private io.privacyresearch.tringapi.TringApi api;
-    private long activeCallId;
     static String libName = "unknown";
     BlockingQueue<TringFrame> frameQueue = new LinkedBlockingQueue();
 
     // state for GroupCall, should be moved.
     private int clientId = -1;
-    private byte[] localGroupId;
-    
-    private static final Logger LOG = Logger.getLogger(TringServiceImpl.class.getName());
 
     static {
         try {
             libName = NativeLibLoader.loadLibrary();
             nativeSupport = true;
             nativeVersion = tringlib_h.getVersion();
-            
         } catch (Throwable ex) {
             System.err.println("No native RingRTC support: ");
             ex.printStackTrace();
         }
     }
-    
 
     public TringServiceImpl() {
         // no-op
@@ -92,11 +89,10 @@ public class TringServiceImpl implements TringService {
     private void initiate() {
         createScope();
         tringlib_h.initRingRTC(toJString(scope, "Hello from Java"));
-        this.callEndpoint = tringlib_h.createCallEndpoint(createStatusCallback(), 
-                createAnswerCallback(), createOfferCallback(),
-                createIceUpdateCallback(),
-                createGenericCallback(),
-        createVideoFrameCallback());
+        this.callEndpoint = tringlib_h.createCallEndpoint(
+                createTringAppInterface(),
+                createStatusCallback());
+        this.tringAppInterface.setNativeCallEndpoint(this.callEndpoint);
         initializeNative(this.callEndpoint);
     }
     
@@ -122,7 +118,7 @@ public class TringServiceImpl implements TringService {
             byte[] senderKey, byte[] receiverKey, byte[] opaque) {
         int mediaType = 0;
         long ageSec = 0;
-        this.activeCallId = callId;
+        this.tringAppInterface.setActiveCallId(callId);
         LOG.info("Pass received offer to tringlib");
         tringlib_h.receivedOffer(callEndpoint, toJString(scope, peerId), callId, mediaType, senderDeviceId,
                 receiverDeviceId, toJByteArray(scope, senderKey), toJByteArray(scope, receiverKey),
@@ -142,7 +138,7 @@ public class TringServiceImpl implements TringService {
             byte[] senderKey, byte[] receiverKey, byte[] opaque) {
         int mediaType = 0;
         long ageSec = 0;
-        this.activeCallId = callId;
+        this.tringAppInterface.setActiveCallId(callId);
         LOG.info("Pass received answer to tringlib");
         tringlib_h.receivedAnswer(callEndpoint, toJString(scope, peerId), callId, senderDeviceId,
                 toJByteArray(scope, senderKey), toJByteArray(scope, receiverKey),
@@ -177,14 +173,14 @@ public class TringServiceImpl implements TringService {
         LOG.info("Set audiorecording");
         tringlib_h.setOutgoingAudioEnabled(callEndpoint, true);
         LOG.info("And now accept the call");
-        tringlib_h.acceptCall(callEndpoint, activeCallId);
+        tringlib_h.acceptCall(callEndpoint, tringAppInterface.getActiveCallId());
         LOG.info("Accepted the call");
     }
 
     @Override
     public void ignoreCall() {
         LOG.info("Ignore the call");
-        tringlib_h.ignoreCall(callEndpoint, activeCallId);
+        tringlib_h.ignoreCall(callEndpoint, tringAppInterface.getActiveCallId());
     }
 
     @Override
@@ -219,26 +215,26 @@ public class TringServiceImpl implements TringService {
 
     // see Android IncomingGroupCallActionProcessor.handleAcceptCall
     @Override
-    public long createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf) {
+    public int createGroupCallClient(byte[] groupId, String sfu, byte[] hkdf) {
         if (groupId != null && groupId.length > 0) {
-            this.localGroupId = groupId;
+            this.tringAppInterface.setLocalGroupId(groupId);
         }
-        LOG.info("delegate creategroupcallclient to rust, groupId = " + Arrays.toString(localGroupId));
-        long myclientId = tringlib_h.createGroupCallClient(callEndpoint, toJByteArray(scope, localGroupId),
+        LOG.info("delegate creategroupcallclient to rust, groupId = " + Arrays.toString(this.tringAppInterface.getLocalGroupId()));
+        this.clientId = tringlib_h.createGroupCallClient(callEndpoint, toJByteArray(scope, this.tringAppInterface.getLocalGroupId()),
                 toJString(scope, sfu), toJByteArray(scope, hkdf));
-        this.clientId = (int) myclientId;
+        this.tringAppInterface.setClientId(this.clientId);
         LOG.info("Created client, id = " + clientId + ". Will connect now");
-        tringlib_h.setOutgoingAudioMuted(callEndpoint, (int) clientId, true);
-        tringlib_h.setOutgoingVideoMuted(callEndpoint, (int) clientId, true);
-        setGroupBandWidth((int) clientId, 1); // 1 = NORMAL
-        tringlib_h.group_connect(callEndpoint, (int) clientId);
+        tringlib_h.setOutgoingAudioMuted(callEndpoint, clientId, true);
+        tringlib_h.setOutgoingVideoMuted(callEndpoint, clientId, true);
+        setGroupBandWidth(clientId, 1); // 1 = NORMAL
+        tringlib_h.group_connect(callEndpoint, clientId);
         LOG.info("Connected, id = " + clientId);
         LOG.info("Ask for video");
-        requestVideo(callEndpoint, (int) clientId, 1);
+        requestVideo(callEndpoint, clientId, 1L);
         LOG.info("Asked for video");
-        tringlib_h.setOutgoingAudioMuted(callEndpoint, (int) clientId, false);
-        tringlib_h.setOutgoingVideoMuted(callEndpoint, (int) clientId, false);
-        setGroupBandWidth((int) clientId, 1); // 1 = NORMAL
+        tringlib_h.setOutgoingAudioMuted(callEndpoint, clientId, false);
+        tringlib_h.setOutgoingVideoMuted(callEndpoint, clientId, false);
+        setGroupBandWidth(clientId, 1); // 1 = NORMAL
         LOG.info("groupCall created, return clientId " + clientId);
         return clientId;
     }
@@ -246,7 +242,7 @@ public class TringServiceImpl implements TringService {
     @Override
     public void joinGroupCall() {
         LOG.info("Joining groupcall");
-        tringlib_h.join(callEndpoint, (int)clientId);
+        tringlib_h.join(callEndpoint, clientId);
         LOG.info("Joined groupcall");
     }
 
@@ -273,7 +269,7 @@ public class TringServiceImpl implements TringService {
     }
 
     @Override
-    public TringFrame getRemoteVideoFrame(int demuxId, boolean skip) {
+    public TringFrame getRemoteVideoFrame(long demuxId, boolean skip) {
         int CAP = 5000000;
         try (Arena rscope = Arena.ofShared()) {
             MemorySegment segment = rscope.allocate(CAP);
@@ -354,7 +350,7 @@ public class TringServiceImpl implements TringService {
         JByteArray.buff(answer, transfer);
         return answer;
     }
-    
+
     static byte[] fromJArrayByte(MemorySegment jArrayByte) {
         int len = (int)JArrayByte.len(jArrayByte);
         MemorySegment dataSegment = JArrayByte.data(jArrayByte).asSlice(0, len);
@@ -410,16 +406,13 @@ public class TringServiceImpl implements TringService {
         api.receivedGroupCallPeekForRingingCheck(peekInfo);
     }
 
-    public void handleRemoteDevicesChanged(List devices) {
-        LOG.info("Devices changed into "+devices);
-        List<Integer> demuxIds = new LinkedList<>();
-        for (Object entry : devices) {
-            ByteBuffer bb = ByteBuffer.wrap((byte[]) entry);
-            int demuxId = bb.getInt();
+    public void handleRemoteDevicesChanged(List<Long> remoteDevices) {
+        LOG.info("Devices changed into " + remoteDevices);
+        List<Long> demuxIds = new LinkedList<>();
+        for (Long demuxId : remoteDevices) {
             demuxIds.add(demuxId);
             LOG.info("Schedule call to request video from "+demuxId);
-            Runnable r = () -> requestVideo(callEndpoint, clientId, demuxId);
-            executeRequest(r);
+            executorService.executeRequest(() -> requestVideo(callEndpoint, clientId, demuxId));
         }
         api.updateRemoteDevices(demuxIds);
     }
@@ -473,221 +466,48 @@ public class TringServiceImpl implements TringService {
 //
     private native void initializeNative(long callEndpoint);
 //    private native void ringrtcReceivedHttpResponse(long callEndpoint, long requestid, int status, byte[] body);
-//
-    private native void requestVideo(long callEndpoint, int clientid, int demuxid);
-//
+
+    private native void requestVideo(long callEndpoint, int clientId, long demuxId);
+
+    MemorySegment createTringAppInterface() {
+        MemorySegment appInterface = AppInterface.allocate(scope);
+
+        this.tringAppInterface = new TringAppInterface(executorService, api, scope);
+
+        AppInterface.destroy(appInterface, AppInterface.destroy.allocate(tringAppInterface::destroy, scope));
+
+        AppInterface.groupConnectionStateChanged(appInterface, AppInterface.groupConnectionStateChanged.allocate(tringAppInterface::groupConnectionStateChanged, scope));
+        AppInterface.groupEnded(appInterface, AppInterface.groupEnded.allocate(tringAppInterface::groupEnded, scope));
+        AppInterface.groupJoinStateChanged(appInterface, AppInterface.groupJoinStateChanged.allocate(tringAppInterface::groupJoinStateChanged, scope));
+        AppInterface.groupRequestGroupMembers(appInterface, AppInterface.groupRequestGroupMembers.allocate(tringAppInterface::groupRequestGroupMembers, scope));
+        AppInterface.groupRequestMembershipProof(appInterface, AppInterface.groupRequestMembershipProof.allocate(tringAppInterface::groupRequestMembershipProof, scope));
+        AppInterface.groupRing(appInterface, AppInterface.groupRing.allocate(tringAppInterface::groupRing, scope));
+
+        AppInterface.sendCallMessage(appInterface, AppInterface.sendCallMessage.allocate(tringAppInterface::sendCallMessage, scope));
+        AppInterface.sendCallMessageToGroup(appInterface, AppInterface.sendCallMessageToGroup.allocate(tringAppInterface::sendCallMessageToGroup, scope));
+
+        AppInterface.signalingMessageAnswer(appInterface, AppInterface.signalingMessageAnswer.allocate(tringAppInterface::signalingMessageAnswer, scope));
+        AppInterface.signalingMessageIce(appInterface, AppInterface.signalingMessageIce.allocate(tringAppInterface::signalingMessageIce, scope));
+        AppInterface.signalingMessageOffer(appInterface, AppInterface.signalingMessageOffer.allocate(tringAppInterface::signalingMessageOffer, scope));
+
+        return appInterface;
+    }
+
     MemorySegment createStatusCallback() {
         StatusCallbackImpl sci = new StatusCallbackImpl();
         MemorySegment seg = createCallEndpoint$statusCallback.allocate(sci, scope);
         return seg;
     }
 
-
-
     class StatusCallbackImpl implements createCallEndpoint$statusCallback.Function {
         @Override
         public void apply(long id, long _x1, int direction, int type) {
             LOG.info("Got new status from ringrtc, id = " + id+", x1 = " + _x1+", dir = " + direction+", type = "+type);
             api.statusCallback(id, _x1, direction, type);
-            sendAck();
-        }
-    }
-    
-    MemorySegment createAnswerCallback() {
-        AnswerCallbackImpl sci = new AnswerCallbackImpl();
-        MemorySegment seg = createCallEndpoint$answerCallback.allocate(sci, scope);
-        return seg;
-    }
-    
-    class AnswerCallbackImpl implements createCallEndpoint$answerCallback.Function {
-        @Override
-        public void apply(MemorySegment opaque) {
-            System.err.println("TRINGBRIDGE, send answer!");
-            byte[] bytes = fromJArrayByte(opaque);
-            System.err.println("TRING, bytes to send = "+java.util.Arrays.toString(bytes));
-            api.answerCallback(bytes);
-            System.err.println("TRING, answer sent");
-            sendAck();
-            System.err.println("TRING, ack sent");
-        }
-    }
-    
-    MemorySegment createOfferCallback() {
-        OfferCallbackImpl sci = new OfferCallbackImpl();
-        MemorySegment seg = createCallEndpoint$offerCallback.allocate(sci, scope);
-        return seg;
-    }
-
-    class OfferCallbackImpl implements createCallEndpoint$offerCallback.Function {
-        @Override
-        public void apply(MemorySegment opaque) {
-            byte[] bytes = fromJArrayByte(opaque);
-            api.offerCallback(bytes);
-            System.err.println("TRING, offer sent");
-            sendAck();
-            System.err.println("TRING, ack sent");
+            tringAppInterface.acknowledgeSignalingMessageSent();
         }
     }
 
-    MemorySegment createIceUpdateCallback() {
-        IceUpdateCallbackImpl sci = new IceUpdateCallbackImpl();
-        MemorySegment seg = createCallEndpoint$iceUpdateCallback.allocate(sci, scope);
-        return seg;
-    }
-
-    class IceUpdateCallbackImpl implements createCallEndpoint$iceUpdateCallback.Function {
-
-        @Override
-        public void apply(MemorySegment icePack) {
-            byte[] bytes = fromJArrayByte(icePack);
-            List<byte[]> iceCandidates = new ArrayList<>();
-            iceCandidates.add(bytes);
-
-            api.iceUpdateCallback(iceCandidates);
-            sendAck();
-            LOG.info("iceUpdate done!");
-        }
-    }
-    MemorySegment createGenericCallback() {
-        GenericCallbackImpl sci = new GenericCallbackImpl();
-        MemorySegment seg = createCallEndpoint$genericCallback.allocate(sci, scope);
-        return seg;
-    }
-
-    class GenericCallbackImpl implements createCallEndpoint$genericCallback.Function {
-
-        @Override
-        public void apply(int opcode, MemorySegment data) {
-            byte[] bytes = fromJArrayByte(data);
-            LOG.info("Got generic  callback, opcode = " + opcode + " and data = " + Arrays.toString(bytes));
-            if (opcode == 1) {
-                LOG.info("This will lead to a groupCallUpdateRing");
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                int groupIdLen = bb.getInt();
-                byte[] groupId = new byte[groupIdLen];
-                bb.get(groupId);
-                TringServiceImpl.this.localGroupId = groupId;
-                LOG.info("Done setting groupId to "+Arrays.toString(TringServiceImpl.this.localGroupId));
-                long ringId = bb.getLong();
-                byte[] senderBytes = new byte[bb.remaining() - 1];
-                bb.get(senderBytes);
-                byte status = bb.get();
-                api.groupCallUpdateRing(groupId, ringId, senderBytes, status);
-            }
-            if (opcode == 2) {
-                // connectionStateChange
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                LOG.info("bb = "+bb);
-                int clientId = bb.getInt();
-                int connectionStatus = bb.getInt();
-                LOG.info("ConnectionState for " + clientId + " changed to " + connectionStatus);
-            }
-            if (opcode == 3) {
-                // requestMembershipProof
-                LOG.info("Handling requestMembershipProof");
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                int clientId = bb.getInt();
-                Runnable r = () -> {
-                    LOG.info("Requesting membership proof, groupid = "+Arrays.toString(TringServiceImpl.this.localGroupId));
-                    byte[] token = api.requestGroupMembershipToken(TringServiceImpl.this.localGroupId);
-                    tringlib_h.setMembershipProof(callEndpoint, clientId, toJByteArray(scope, token));
-                };
-                executeRequest(r);
-                LOG.info("Handled requestMembershipProof");
-            }
-            if (opcode == 4) {
-                // requestGroupMembers
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                int clientId = bb.getInt();
-                byte[] memberinfo = api.requestGroupMemberInfo(TringServiceImpl.this.localGroupId);
-                tringlib_h.setGroupMembers(callEndpoint, clientId, toJByteArray(scope, memberinfo));
-            }
-            if (opcode == 5) {
-                // sendCallMessage
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                UUID recipient = new UUID(bb.getLong(), bb.getLong());
-                int mlen = bb.getInt();
-                byte[] messageb = new byte[mlen];
-                LOG.info("Will send opaquecallmessage to " + recipient+" with byte len = " + mlen);
-                bb.get(messageb);
-                api.sendOpaqueCallMessage(recipient, messageb, 0);
-            }
-            if (opcode == 6) {
-                LOG.info("Joinstatechanged");
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                int clientId = bb.getInt();
-                int joinStatus = bb.getInt();
-                LOG.info("JoinStatus, cid = " + clientId+" and js = "+joinStatus);
-                processJoinStatus(joinStatus);
-            }
-            if (opcode == 7) {
-                LOG.info("Needs to send a SignalCallMessage");
-                ByteBuffer bb = ByteBuffer.wrap(bytes);
-                int groupIdLen = bb.getInt();
-                byte[] groupId = new byte[groupIdLen];
-                bb.get(groupId);
-                LOG.info("GroupId = "+Arrays.toString(groupId));
-                byte[] msg = new byte[bb.remaining() - 1];
-                bb.get(msg);
-                byte urgency = bb.get();
-                api.sendOpaqueGroupCallMessage(groupId, msg, urgency);
-                LOG.info("Done sending (request to) signal call message");
-            }
-        }
-    }
-
-    void processJoinStatus(int status) {
-        LOG.info("New joinstatus = "+status);
-        if (status == 3) {
-            LOG.info("We joined, now do a group call ring");
-            tringlib_h.group_ring(callEndpoint, 1);
-        }
-        LOG.info("JoinStatus processed");
-    }
-
-    MemorySegment createVideoFrameCallback() {
-        VideoFrameCallbackImpl sci = new VideoFrameCallbackImpl();
-        MemorySegment seg = createCallEndpoint$videoFrameCallback.allocate(sci, scope);
-        return seg;
-    }
-    
-    @Deprecated
-    class VideoFrameCallbackImpl implements createCallEndpoint$videoFrameCallback.Function {
-        @Override
-        public void apply(MemorySegment opaque, int w, int h, long size) {
-            LOG.info("Got incoming video frame in Java layer, w = "+w+", h = " + h+", size = " + size);
-            System.err.println("Opaque = " + opaque);
-            MemorySegment segment = opaque.asSlice(0, size);//MemorySegment.ofAddress(opaque, size, scope);
-            byte[] raw = segment.toArray(ValueLayout.JAVA_BYTE);
-            synchronized (frameQueue) {
-                LOG.info("Add frame to queue");
-                frameQueue.add(new TringFrame(w,h,-1,raw));
-                frameQueue.notifyAll();
-            }
-            LOG.info("Processed incoming video frame in Java layer");
-            sendAck();
-        }
-    }
-
-    // We need to inform ringrtc that we handled a message, so that it is ok
-    // with sending the next message
-    void sendAck() {
-        LOG.info("Send Ack");
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment callid = arena.allocateFrom(ValueLayout.JAVA_LONG, activeCallId);
-            tringlib_h.signalMessageSent(callEndpoint, callid);
-        }
-        LOG.info("Send Ack done");
-    }
-
-    ExecutorService executor = Executors.newFixedThreadPool(1);
-
-    private void executeRequest(Runnable r) {
-        LOG.info("Executing request "+r);
-        Future<?> submit = executor.submit(r);
-        LOG.info("Execution state = " + submit.state());
-    }
-    
     @Override
     public byte[] getCallLinkBytes(String link) {
         try {
@@ -704,7 +524,7 @@ public class TringServiceImpl implements TringService {
             throw new RuntimeException(ex);
         }
     }
-    
+
     class CallLinkCallbackImpl implements rtc_calllinks_CallLinkRootKey_parse$callback.Function {
 
         CountDownLatch cdl;
@@ -723,7 +543,5 @@ public class TringServiceImpl implements TringService {
             MemorySegment.copy(ptr2, 0, byteArraySegment, 0, count);
             cdl.countDown();
         }
-
     }
-
 }

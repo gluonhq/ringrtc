@@ -165,7 +165,7 @@ fi
     echo "Build final RingRTC"
     if [ "${BUILD_TYPE}" = "debug" ]
     then
-        RUSTFLAGS="${RUSTFLAGS_WIN}" OUTPUT_DIR="${OUTPUT_DIR}" cargo build --target ${CARGO_TARGET} --features java
+        RUSTFLAGS="${RUSTFLAGS_WIN}" OUTPUT_DIR="${OUTPUT_DIR}" cargo rustc --package ringrtc --target ${CARGO_TARGET} --features java --crate-type cdylib
     else
         #OUTPUT_DIR="${OUTPUT_DIR}" cargo build --target ${CARGO_TARGET} --lib --features java --release
         RUSTFLAGS="${RUSTFLAGS}" OUTPUT_DIR="${OUTPUT_DIR}" cargo rustc --package ringrtc --target ${CARGO_TARGET} --features java --release --crate-type cdylib
@@ -184,13 +184,13 @@ fi
         mkdir -p ../java/build/win32
         cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/ringrtc.dll ../java/tring/src/main/resources/ringrtc.dll
         # cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/ringrtc.dll ../java/build/win32/libringrtc-"${TARGET_ARCH}".java
-        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/win32 --output ../java/tring/src/main/java -t io.privacyresearch.tring tringlib.h
+        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/win32 --output ../java/tring/src/gen-sources/java -t io.privacyresearch.tring tringlib.h
     elif [ $DEFAULT_PLATFORM = "linux" ]
     then
         mkdir -p ../java/build/linux
         cp -f ../../target/${CARGO_TARGET}/${BUILD_TYPE}/libringrtc.so ../java/tring/src/main/resources/libringrtc.so
         #cp -f target/${CARGO_TARGET}/${BUILD_TYPE}/libringrtc.so ../java/build/linux/libringrtc-"${TARGET_ARCH}".java
-        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/linux --output ../java/tring/src/main/java -t io.privacyresearch.tring tringlib.h
+        ${JEXTRACT}/bin/jextract -I${JDK}include -I${JDK}/include/linux --output ../java/tring/src/gen-sources/java -t io.privacyresearch.tring tringlib.h
     fi
     cd ../java/tringapi
     mvn clean install

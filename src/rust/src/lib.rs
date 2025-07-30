@@ -89,6 +89,7 @@ pub mod native;
 
 #[cfg(feature = "java")]
 pub mod java {
+    mod app_interface;
     mod java;
     mod jtypes;
 }

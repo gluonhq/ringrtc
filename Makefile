@@ -93,12 +93,12 @@ java:
 		echo "java: Preparing workspace for $(PLATFORM)" ; \
 		./bin/prepare-workspace $(PLATFORM) ; \
 	fi
-	$(Q) if [ "$(TYPE)" = "release" ] ; then \
+	$(Q) if [ "$(TYPE)" = "debug" ] ; then \
 		echo "java: Release build" ; \
-		./bin/build-java -r --ringrtc-only; \
+		./bin/build-java -d --ringrtc-only; \
 	else \
 		echo "java: Debug build" ; \
-		./bin/build-java -d --ringrtc-only; \
+		./bin/build-java -r --ringrtc-only; \
 	fi
 
 cli:
